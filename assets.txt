@@ -1,0 +1,6 @@
+BTC
+AVAX
+DOT
+FTM
+LINK
+SOL
