@@ -1,0 +1,12 @@
+numpy
+pandas
+python-dotenv
+pytz
+websockets
+msgpack
+numpy-ringbuffer
+eth-account
+eth-utils
+aiosonic
+quant-telegram
+-e ../framework/quantpylib
