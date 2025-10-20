@@ -1,6 +1,7 @@
 import numpy as np
 import asyncio
 from data import MarketData, get_key
+from positions import ArbitrageLeg, ArbitragePosition
 import pytz
 from datetime import datetime, timedelta
 import logging
@@ -45,6 +46,9 @@ taker_balance = {
     'paradex': {},
 }
 
+active_positions = {}
+pending_fills = {}
+
 ceil_to_n = lambda x, n: round((math.ceil(x*(10**n)))/(10**n), n)
 round_hr = lambda dt: (dt+ timedelta(minutes=30)).replace(second=0, microsecond=0, minute=0)
 
@@ -61,7 +65,9 @@ async def trade(timeout, **kwargs):
 async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset):
     # construct 3 important dicts
     contracts_on_asset = { # exchange > contracts
-        exchange: (len(market_data.get_base_mappings(exchange)[asset]) if asset in market_data.get_base_mappings(exchange) else 0) 
+        exchange: (len(market_data.get_base_mappings(exchange)[asset]) 
+                   if asset in market_data.get_base_mappings(exchange) 
+                   else 0) 
         for exchange in exchanges
     }
     
@@ -82,16 +88,13 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
             
             # Calculating all the relevant metrics for each contract
             for contract in mapped:
-                # print("this is the contract")
-                # print(contract['symbol'], contract.keys())
-
                 if contract["symbol"] in positions[exchange]:
                     nominal_position += positions[exchange][contract["symbol"]][mk.VALUE]
                     
                 lob = market_data.get_l2_stream(exchange, contract['symbol'])
                 l2_last = {'ts': lob.timestamp, 'b': lob.bids, 'a': lob.asks}
+                # TODO: Conversion implementation
                 fx = 1 # if contract['quote_asset'] == 'USDT' else usdc_usdt_conversion()
-                logging.info(f"to be fixed fx: {fx}")
                 l2_ts = l2_last['ts']
                 bidX = l2_last['b'][0][0] * fx
                 askX = l2_last['a'][0][0] * fx
@@ -138,13 +141,14 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
                 if icontract['exchange'] == jcontract['exchange']:
                     continue
                 
-                # Compute tuple in both directions
+                # Compute tuple in both directions (long, short)
                 ij_ticker = (icontract['symbol'], icontract['exchange'], jcontract['symbol'], jcontract['exchange'])
                 ji_ticker = (jcontract['symbol'], jcontract['exchange'], icontract['symbol'], icontract['exchange'])
                 
                 if ij_ticker in skip or ji_ticker in skip:
                     continue
                 
+                # Adding the pair to the skip set if the data is stale
                 l2_delay = int(time.time() *1000) - min(icontract['l2_ts'], jcontract['l2_ts'])
                 if l2_delay > 4000:
                     skip.add(ij_ticker)
@@ -170,7 +174,7 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
                 
                 evs[ij_ticker] = 0.9 *evs[ij_ticker]+ 0.1* ij_ev if ij_ticker in evs else ij_ev
                 evs[ji_ticker] = 0.9 *evs[ji_ticker]+ 0.1* ji_ev if ji_ticker in evs else ji_ev
-                ticker_stats[ij_ticker] = [icontract, jcontract, avg_mark]
+                ticker_stats[ij_ticker] = [icontract, jcontract, avg_mark] #tuple to match with a list of 3 dictionary values
                 ticker_stats[ji_ticker] = [jcontract, icontract, avg_mark]
             
         iter += 1
@@ -199,7 +203,7 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
             cross_contracts = contracts_on_asset[pair[1]] * contracts_on_asset[pair[3]]
             tradable_notional = min(cap_dollars[pair[1]][0], cap_dollars[pair[3]][1])/ cross_contracts # long exchange, short exchange
             
-            pair_stats = ticker_stats[pair]
+            pair_stats = ticker_stats[pair] # pair (asset1, exchange1, asset2, exchange2)# returning [icontract, jcontract, avg_mark]
             
             print(tradable_notional, cross_contracts, pair_stats[2], pair_stats[0]['quantity_precision'], pair_stats[0]['min_notional'])
             
@@ -210,17 +214,17 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
             min_notional = max(float(buy['min_notional']), float(sell['min_notional'])) + 10.0
             
             min_volume = round(min_notional / pair_stats[2], cross_precision)
-            max_volume = round(tradable_notional/pair_stats[2], cross_precision)
+            max_volume = round(tradable_notional / pair_stats[2], cross_precision)
             max_volume = max_volume if pair not in submitted_volumes else max_volume - submitted_volumes[pair]
             if min_volume > max_volume : continue
             
-            # Maker and taker fees 
+            # Maker and taker fees: take the bid or sell from both exchange, to see which one have positive spread
             mt_basis = sell['bidX'] - buy['bidX'] # maker on buy, taker on sell
             tm_basis = sell['askX'] - buy['askX'] # taker on buy, maker on sell
             
             mt_fees = trade_fees[buy['exchange']][0] + trade_fees[sell['exchange']][1]
             tm_fees = trade_fees[buy['exchange']][1] + trade_fees[sell['exchange']][0]
-            mt_adj_basis = mt_basis - mt_fees * pair_stats[2]
+            mt_adj_basis = mt_basis - mt_fees * pair_stats[2] #mark price
             tm_adj_basis = tm_basis - tm_fees * pair_stats[2]
             
             side = 'mt' if mt_adj_basis > tm_adj_basis else 'tm' # choose which one is more profitable
@@ -266,7 +270,7 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
                 
                 order_config = {
                     "ticker": pair[2],
-                    "amount": min(taker_miv, max_volume),
+                    "amount": min(taker_miv, max_volume) * -1,
                     "exc": pair[3],
                     "price": maker_book[-1,1,0],
                     "tif": mk.TIME_IN_FORCE_ALO,
@@ -277,10 +281,10 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
                 orders.append(order_config)
                 registers.append({
                     "pair_ticker": pair,
-                    "maker": pair[1],
-                    "maker_ticker": pair[0],
-                    "taker": pair[3],
-                    "taker_ticker": pair[2],
+                    "maker": pair[3],
+                    "maker_ticker": pair[2],
+                    "taker": pair[1],
+                    "taker_ticker": pair[0],
                     "taker_precision": int(sell['quantity_precision']),
                     "taker_min": ceil_to_n(float(sell['min_notional'])/ pair_stats[2], int(sell['quantity_precision'])),
                 })
@@ -303,7 +307,9 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
                         submitted_volumes[pair] = abs(order['amount'])
                     else:
                         submitted_volumes[pair] += abs(order['amount'])
+                        
 
+# Handlers return a async function
 def binance_fill_handler(gateway):
     '''check binance payload documentation: https://developers.binance.com/docs/binance-spot-api-docs/websocket-api/user-data-stream-requests'''
     async def handler(msg):
@@ -361,11 +367,21 @@ to hedge this amount.
 - if the filled amount is hedge-able by the trading rule, hedge it. otherwise store inside a buffer
 '''
 async def hedge(oid, exchange, fillamt, gateway):
-    global taker_balance
+    global taker_balance, active_positions, pending_fills
     try:
         if oid not in maker_register[exchange]:
             return 
         register = maker_register[exchange][oid]
+        
+        # store market fill data
+        maker_fill_data = {
+            'oid': oid,
+            'exchange': exchange,
+            'fillamt': fillamt,
+            'fill_time': datetime.now(),
+            'register': register
+        }
+        pending_fills[oid] = maker_fill_data
         
         taker = register['taker']
         taker_ticker = register['taker_ticker']
@@ -384,15 +400,87 @@ async def hedge(oid, exchange, fillamt, gateway):
             logging.warning('Order size has been buffered: hedge amount: %s', hedge_amount)
             
         else:
-            await gateway.executor.market_order(
-                ticker=taker_ticker,
-                amount=hedge_amount,
-                exc=taker
-            )
-            taker_balance[taker][taker_ticker] = Decimal('0')
+            try:
+                hedge_result = await gateway.executor.market_order(
+                    ticker=taker_ticker,
+                    amount=hedge_amount,
+                    exc=taker
+                )
+                
+                await create_complete_position(
+                    maker_fill=maker_fill_data,
+                    taker_fill={
+                        'exchange': taker,
+                        'ticker':taker_ticker,
+                        'fillamt': fillamt,
+                        "fill_time": datetime.now(),
+                        'result': hedge_result
+                    }
+                )
+                
+                taker_balance[taker][taker_ticker] = Decimal('0')     
+                if oid in pending_fills:
+                    del pending_fills[oid]
+                    
+            except Exception as e:
+                logging.error(f'Failed to execute hedge for {oid}: {e}')
     except:
         logging.error(f'Error in hedging, exchange {exchange}, {oid}: {fillamt}')
+        
+async def create_complete_position(maker_fill, taker_fill):
+    global active_positions
+    
+    register = maker_fill['register']
+    pair = register['pair_ticker']
+    buy_exchange, sell_exchange = pair[1], pair[3]
+    
+    maker_exchange = maker_fill['exchange']
+    taker_exchange = taker_fill['exchange']
+    
+    if maker_exchange == buy_exchange:
+        maker_side='long'
+        taker_side='short'
+    else:
+        maker_side='short'
+        taker_side='long'
+        
+    maker_leg = ArbitrageLeg(
+        exchange=maker_exchange,
+        ticker=register['maker_ticker'],
+        side = maker_side,
+        size = abs(maker_fill['fillamt']),
+        entry_price=Decimal('0'),
+        order_id=maker_fill['oid'],
+        fill_time= maker_fill['fill_time'],
+        exit_price=None,
+        exit_time=None
+    )
+    
+    taker_leg = ArbitrageLeg(
+          exchange=taker_exchange,
+          ticker=taker_fill['ticker'],
+          side=taker_side,
+          size=abs(taker_fill['fillamt']),
+          entry_price=Decimal('0'),  # Would need to get from fill result
+          order_id=None,  # Market order, might not have persistent ID
+          fill_time=taker_fill['fill_time'],
+          exit_price=None,
+          exit_time=None
+    )
+    position = ArbitragePosition(
+        position_id=f"{pair}_{int(maker_fill['fill_time'].timestamp())}_{maker_fill['oid']}",
+        asset=register.get('asset', 'UNKNOWN'),  # You'll need to pass this through
+        legs=[maker_leg, taker_leg],
+        entry_time=maker_fill['fill_time'],
+        entry_funding_rate=0.0,  # You'll need to calculate this
+        entry_basis=0.0,  # You'll need to calculate this
+        target_profit=0.15,
+        stop_loss=-0.05
+    )
 
+      # Store the position
+    active_positions[position.position_id] = position
+    
 async def oid_limit(afunc, kwargs):
     try:
         res = await afunc(**kwargs)
@@ -478,7 +566,7 @@ async def main():
     gateway = Gateway(config_keys=get_key())
     await gateway.init_clients()
     
-    # exchange fills backlog
+    # exchange fills backlog, maker_handlers['hyperliquid'] == hyperliquid_fill_handler(gateway)
     maker_handlers = {
         "hyperliquid": hyperliquid_fill_handler(gateway),
         "paradex": paradex_fill_handler(gateway),
@@ -486,7 +574,7 @@ async def main():
     
     assert all(exchange in maker_handlers for exchange in exchanges)
     await asyncio.gather(*[
-        gateway.executor.account_fill_subscribe(exc=exc, handler= maker_handlers[exc]) for exc in exchanges
+        gateway.account.account_fill_subscribe(exc=exc, handler= maker_handlers[exc]) for exc in exchanges
     ])
     
     market_data = MarketData(
@@ -528,13 +616,14 @@ async def main():
         try: 
             nominals= np.array(
                 [float(np.sum(v[mk.VALUE] for v in position.values())) for position in positions]
-            )
+            ) # give an array of total values (nominals) in each exchange: [4000], [500] #binance, hyperliquid
             
             betas = nominals / equities # first value is exchange equity, second is nominal (2-dimensional array)
             thresholds = [0.00015 + 0.0005 + np.tanh(beta/3 *np.array([1,-1])) for beta in betas]
-            ev_thresholds = {exc: thresh for exc, thresh in zip(exchanges, thresholds)}
+            ev_thresholds = {exc: thresh for exc, thresh in zip(exchanges, thresholds)} # dictionary mapping
             
-            per_asset = {ex: leverage * eq/ len(market_data.get_base_mappings(ex)) for  ex, eq in zip(exchanges, equities)}
+            # allocating the net assets on each exchanges, by deviding the equities with tradable assets
+            per_asset = {ex: leverage * eq/ len(market_data.get_base_mappings(ex)) for ex, eq in zip(exchanges, equities)}
             
             logging.info(f"ev thresholds: {ev_thresholds}, per asset: {per_asset}")
             

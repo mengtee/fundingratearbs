@@ -83,3 +83,5 @@ Thumbs.db
 *.log
 config/
 credentials/
+
+pseudocode.md
