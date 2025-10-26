@@ -1,7 +1,6 @@
 import numpy as np
 import asyncio
 from data import MarketData, get_key
-from positions import ArbitrageLeg, ArbitragePosition
 import pytz
 from datetime import datetime, timedelta
 import logging
@@ -46,9 +45,6 @@ taker_balance = {
     'paradex': {},
 }
 
-active_positions = {}
-pending_fills = {}
-
 ceil_to_n = lambda x, n: round((math.ceil(x*(10**n)))/(10**n), n)
 round_hr = lambda dt: (dt+ timedelta(minutes=30)).replace(second=0, microsecond=0, minute=0)
 
@@ -71,7 +67,7 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
         for exchange in exchanges
     }
     
-    positions = {exc: pos for exc, pos in zip(exchanges, positions)} # exchange -> positions
+    positions = {exc: pos for exc, pos in zip(exchanges, positions)} # {exchange -> positions}
     evs= {} # 
     iter = 0
     nominal_exchange = {} # exchange -> nominal held
@@ -81,7 +77,7 @@ async def _trade(gateway, exchanges, asset, positions, ev_thresholds, per_asset)
     while True:
         contracts = [] # list of contract dicts
         for exchange in exchanges:
-            mapping = market_data.get_base_mappings(exchange) # exchange > asset > contract
+            mapping = market_data.get_base_mappings(exchange) #{ exchange > asset,contract}
             mapped = mapping.get(asset, []) # returning a list from the key
             
             nominal_position = 0
@@ -367,22 +363,11 @@ to hedge this amount.
 - if the filled amount is hedge-able by the trading rule, hedge it. otherwise store inside a buffer
 '''
 async def hedge(oid, exchange, fillamt, gateway):
-    global taker_balance, active_positions, pending_fills
+    global taker_balance
     try:
         if oid not in maker_register[exchange]:
             return 
         register = maker_register[exchange][oid]
-        
-        # store market fill data
-        maker_fill_data = {
-            'oid': oid,
-            'exchange': exchange,
-            'fillamt': fillamt,
-            'fill_time': datetime.now(),
-            'register': register
-        }
-        pending_fills[oid] = maker_fill_data
-        
         taker = register['taker']
         taker_ticker = register['taker_ticker']
         
@@ -401,86 +386,18 @@ async def hedge(oid, exchange, fillamt, gateway):
             
         else:
             try:
-                hedge_result = await gateway.executor.market_order(
+                await gateway.executor.market_order(
                     ticker=taker_ticker,
                     amount=hedge_amount,
                     exc=taker
-                )
-                
-                await create_complete_position(
-                    maker_fill=maker_fill_data,
-                    taker_fill={
-                        'exchange': taker,
-                        'ticker':taker_ticker,
-                        'fillamt': fillamt,
-                        "fill_time": datetime.now(),
-                        'result': hedge_result
-                    }
-                )
-                
-                taker_balance[taker][taker_ticker] = Decimal('0')     
-                if oid in pending_fills:
-                    del pending_fills[oid]
+                )           
+                taker_balance[taker][taker_ticker] = Decimal('0') 
                     
             except Exception as e:
                 logging.error(f'Failed to execute hedge for {oid}: {e}')
     except:
         logging.error(f'Error in hedging, exchange {exchange}, {oid}: {fillamt}')
         
-async def create_complete_position(maker_fill, taker_fill):
-    global active_positions
-    
-    register = maker_fill['register']
-    pair = register['pair_ticker']
-    buy_exchange, sell_exchange = pair[1], pair[3]
-    
-    maker_exchange = maker_fill['exchange']
-    taker_exchange = taker_fill['exchange']
-    
-    if maker_exchange == buy_exchange:
-        maker_side='long'
-        taker_side='short'
-    else:
-        maker_side='short'
-        taker_side='long'
-        
-    maker_leg = ArbitrageLeg(
-        exchange=maker_exchange,
-        ticker=register['maker_ticker'],
-        side = maker_side,
-        size = abs(maker_fill['fillamt']),
-        entry_price=Decimal('0'),
-        order_id=maker_fill['oid'],
-        fill_time= maker_fill['fill_time'],
-        exit_price=None,
-        exit_time=None
-    )
-    
-    taker_leg = ArbitrageLeg(
-          exchange=taker_exchange,
-          ticker=taker_fill['ticker'],
-          side=taker_side,
-          size=abs(taker_fill['fillamt']),
-          entry_price=Decimal('0'),  # Would need to get from fill result
-          order_id=None,  # Market order, might not have persistent ID
-          fill_time=taker_fill['fill_time'],
-          exit_price=None,
-          exit_time=None
-    )
-    position = ArbitragePosition(
-        position_id=f"{pair}_{int(maker_fill['fill_time'].timestamp())}_{maker_fill['oid']}",
-        asset=register.get('asset', 'UNKNOWN'),  # You'll need to pass this through
-        legs=[maker_leg, taker_leg],
-        entry_time=maker_fill['fill_time'],
-        entry_funding_rate=0.0,  # You'll need to calculate this
-        entry_basis=0.0,  # You'll need to calculate this
-        target_profit=0.15,
-        stop_loss=-0.05
-    )
-
-      # Store the position
-    active_positions[position.position_id] = position
-    
 async def oid_limit(afunc, kwargs):
     try:
         res = await afunc(**kwargs)
@@ -522,7 +439,7 @@ async def hedge_excess(gateway, exchanges, assets):
     
     for asset, net in asset_net.items():
         # TODO: Binance references here (using largest exchange for hedging)
-        if net != 0:
+        if net != 0: # unhedge positions
             asset_mappings = market_data.get_base_mappings('binance')[asset]
             hedge_contract = None
             
